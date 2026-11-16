@@ -1,0 +1,38 @@
+Act as a principal researcher in adaptive signal processing and statistical machine learning. 
+
+### Context & Physical Setup
+We are performing motion artifact cancellation (MAC) on wrist-worn photoplethysmography (PPG) signals to estimate heart rate (BPM) during intense physical exercise (IEEE Signal Processing Cup 2015 / IEEEPPG dataset).
+- **Sampling & Windowing:** Data is sampled at $f_s = 125\text{ Hz}$. Each window is strictly isolated and evaluated independently: $N = 1000\text{ samples}$ ($8\text{ seconds}$). 
+- **Hard Constraint:** Processing is strictly memoryless across windows—no cross-window state propagation, warm-starting, or historical tracking is permitted.
+- **Signals:** Dual-channel PPG (primary signals $d_1[n], d_2[n]$) and tri-axial accelerometer data (reference noise inputs $x, y, z$).
+- **Preprocessing:** All channels are pre-filtered with an 8th-order effective zero-phase Butterworth bandpass filter ($[0.5, 4.0]\text{ Hz}$, corresponding to $30 - 240\text{ BPM}$) and normalized to zero mean, unit variance.
+- **Current Pipeline:** Parallel adaptive filters estimate motion artifacts from the reference vector $a[n] \in \mathbb{R}^{3M}$ (order $M$ per axis, total taps $L = 3M$). Cleaned signals are combined via SNR-weighted late fusion, followed by a zero-padded modified periodogram ($NFFT \in \{4096, 8192\}$) to detect the cardiac spectral peak.
+- **Optimization:** An automated Tree-structured Parzen Estimator (TPE / Bayesian optimization) tunes the hyperparameters against a composite loss combining AAE, RMSE, and outlier penalty ($>10\text{ BPM}$).
+
+### The Problem
+When integrating conventional Recursive Least Squares (RLS):
+1. RLS slightly underperformed Variable Step-Size LMS (VS-LMS) by approximately 1% on the objective function.
+2. The hyperparameter optimizer hit the hard boundaries of the explored parameter space:
+   - Forgetting factor: $\lambda \to 0.999$ (saturated against the upper ceiling).
+   - Regularization parameter: $\delta \to 0.01$ (saturated against the lower floor, where $P[-1] = \delta^{-1} I$).
+3. The filter order $M$ is dynamically tuned by the optimizer, but the narrowband nature of the prefiltered accelerometer inputs ($[0.5, 4.0]\text{ Hz}$ at $125\text{ Hz}$) introduces extreme collinearity and high condition numbers $\chi(R_a) \gg 10^3$ in the sample correlation matrix.
+
+### Objective & Creative Mandate
+Re-architect and diagnose the RLS branch to unlock its theoretical convergence superiority within these isolated 8-second epochs. Do not limit yourself to standard textbook RLS updates. Explore the problem holistically with complete technical freedom and creativity:
+
+1. **Boundary & Conditioning Re-engineering:**
+   - Investigate why the optimizer demands $\delta < 0.01$ (hyper-aggressive initial inverse covariance) and $\lambda \to 1.0$, and reformulate the initialization and regularization mechanics (e.g., dynamic diagonal loading, Tikhonov regularization, Levenberg-Marquardt damping, or input-power-dependent $\delta$).
+   - Rethink the hyperparameter search topology for $\lambda$ and $\delta$ to prevent boundary pinning while ensuring the algorithm does not cancel the quasi-periodic cardiac component.
+
+2. **Reference Subspace & Collinearity Management:**
+   - Given the extreme autocorrelation of $125\text{ Hz}$ signals bandlimited to $4\text{ Hz}$, explore whether structural pre-conditioning of the reference space (e.g., decimation, multirate schemes, principal component / Karhunen-Loève projection, differential filtering, or lattice/orthogonalized RLS structures) could stabilize $P[n]$ and eliminate excess variance in the tap weights.
+
+3. **Window-Level Transient & Convergence Handling:**
+   - Because $w[-1] = 0$ is reset every window, analyze the spectral corruption introduced by early-sample adaptation transients ($n < 2L$) on the periodogram, and propose principled mitigations (e.g., transient masking/blanking, selective tapering, back-and-forth bidirectional RLS filtering within the isolated window, or smooth error-gating).
+
+4. **Algorithmic & Structural Innovations:**
+   - Consider alternative recursive formulations that might outperform standard exponentially weighted RLS in this bio-signal context (e.g., Variable Forgetting Factor RLS, Sliding-Window RLS, Normalized RLS, Extended/State-Space formulations, or robust M-estimator RLS robust to impulsive sensor-motion spikes).
+
+Deliver a rigorous mathematical critique of why the naive implementation hit these failure modes, followed by concrete, highly creative algorithmic proposals and an optimized experimental design ready for implementation.
+Detail all your reasoning in the txt file
+Dont execute the computational demanding tasks, as they will be done on a seperate machine
