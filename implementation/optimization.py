@@ -41,6 +41,8 @@ try:
     from .reference_construction import build_U
     from .LMS_algorithms import (
         LMS_REGISTRY,
+        OPTIMAL_LMS_HR_CONFIG,
+        OPTIMAL_LMS_PARAMS,
         OPTIMAL_NLMS_HR_CONFIG,
         OPTIMAL_NLMS_PARAMS,
         OPTIMAL_VS_LMS_HR_CONFIG,
@@ -60,6 +62,8 @@ except ImportError:
     from reference_construction import build_U
     from LMS_algorithms import (
         LMS_REGISTRY,
+        OPTIMAL_LMS_HR_CONFIG,
+        OPTIMAL_LMS_PARAMS,
         OPTIMAL_NLMS_HR_CONFIG,
         OPTIMAL_NLMS_PARAMS,
         OPTIMAL_VS_LMS_HR_CONFIG,
@@ -114,6 +118,18 @@ PROJECT1_CV_REFERENCE: dict = {
         "score_aae": 12.52,
         "score_rmse": 22.45,
         "outlier_pct": 29.9,
+    },
+    "lms": {
+        "hyperparameters": {
+            "lms_algorithm": "lms",
+            "lms_params": dict(OPTIMAL_LMS_PARAMS),
+            "hr_algorithm": OPTIMAL_LMS_HR_CONFIG["hr_algorithm"],
+            "hr_params": dict(OPTIMAL_LMS_HR_CONFIG["hr_params"]),
+        },
+        "score_objective": 12.88,
+        "score_aae": 5.18,
+        "score_rmse": 16.93,
+        "outlier_pct": 6.9,
     },
     "nlms": {
         "hyperparameters": {
@@ -594,6 +610,46 @@ def run_phase2_tpe_optimization(
     return best_config, best_score, phase2_history
 
 
+def evaluate_model_cv(
+    preprocessed_windows: list[tuple],
+    y: np.ndarray,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    lms_algo: str,
+    M: int,
+    lms_params: dict,
+    hr_algo: str,
+    hr_params: dict,
+) -> dict:
+    """Evaluate any configured adaptive filter + HR detector across Subject-Wise Group K-Folds."""
+    fold_objs, fold_aaes, fold_rmses, fold_outs = [], [], [], []
+    for _, val_indices in splits:
+        val_preds = []
+        val_targets = y[val_indices]
+        for w_idx in val_indices:
+            cached_win = preprocessed_windows[int(w_idx)]
+            e_fused = _filter_cached_window(cached_win, lms_algo, M, lms_params)
+            val_preds.append(estimate_bpm_window(e_fused, hr_algorithm=hr_algo, **hr_params))
+        preds_arr = np.asarray(val_preds, dtype=float)
+        if np.all(np.isfinite(preds_arr)):
+            abs_err = np.abs(preds_arr - val_targets)
+            fold_objs.append(objective_function(preds_arr, val_targets))
+            fold_aaes.append(float(np.mean(abs_err)))
+            fold_rmses.append(float(np.sqrt(np.mean(abs_err**2))))
+            fold_outs.append(float(np.mean(abs_err > 10.0) * 100.0))
+        else:
+            fold_objs.append(float("inf"))
+            fold_aaes.append(float("inf"))
+            fold_rmses.append(float("inf"))
+            fold_outs.append(100.0)
+
+    return {
+        "score_objective": float(np.mean(fold_objs)),
+        "score_aae": float(np.mean(fold_aaes)),
+        "score_rmse": float(np.mean(fold_rmses)),
+        "outlier_pct": float(np.mean(fold_outs)),
+    }
+
+
 def evaluate_baseline_without_lms(
     preprocessed_windows: list[tuple],
     y: np.ndarray,
@@ -721,18 +777,57 @@ def optimize_hr_pipeline(
         fs=FS,
     )
 
-    # Include pre-configured NLMS and VS-LMS models using Project 1 optimal hyperparameters
-    nlms_model = HeartRateEstimatorModel.from_project1_optimal("nlms", fs=FS)
-    vs_lms_model = HeartRateEstimatorModel.from_project1_optimal("vs_lms", fs=FS)
+    # Option B (Feature-Matched): apply the winning RLS structural features
+    # (`delay_step`, `huber_c`, `warm_start_ratio`) to Project 1 optimal NLMS & VS-LMS
+    shared_opt_b = {
+        k: best_rls_cfg["lms_params"][k]
+        for k in ("delay_step", "huber_c", "warm_start_ratio")
+        if k in best_rls_cfg["lms_params"]
+    }
+    nlms_model = HeartRateEstimatorModel.from_project1_optimal("nlms", fs=FS, **shared_opt_b)
+    vs_lms_model = HeartRateEstimatorModel.from_project1_optimal("vs_lms", fs=FS, **shared_opt_b)
+
+    nlms_cv = evaluate_model_cv(
+        preprocessed_windows,
+        y,
+        splits,
+        lms_algo=nlms_model.lms_algorithm,
+        M=nlms_model.M,
+        lms_params=nlms_model.lms_params,
+        hr_algo=nlms_model.hr_algorithm,
+        hr_params=nlms_model.hr_params,
+    )
+    vs_lms_cv = evaluate_model_cv(
+        preprocessed_windows,
+        y,
+        splits,
+        lms_algo=vs_lms_model.lms_algorithm,
+        M=vs_lms_model.M,
+        lms_params=vs_lms_model.lms_params,
+        hr_algo=vs_lms_model.hr_algorithm,
+        hr_params=vs_lms_model.hr_params,
+    )
 
     results_by_lms: dict[str, dict] = {
         "nlms": {
             "model": nlms_model,
-            **PROJECT1_CV_REFERENCE["nlms"],
+            "hyperparameters": {
+                "lms_algorithm": nlms_model.lms_algorithm,
+                "lms_params": {"M": nlms_model.M, **nlms_model.lms_params},
+                "hr_algorithm": nlms_model.hr_algorithm,
+                "hr_params": dict(nlms_model.hr_params),
+            },
+            **nlms_cv,
         },
         "vs_lms": {
             "model": vs_lms_model,
-            **PROJECT1_CV_REFERENCE["vs_lms"],
+            "hyperparameters": {
+                "lms_algorithm": vs_lms_model.lms_algorithm,
+                "lms_params": {"M": vs_lms_model.M, **vs_lms_model.lms_params},
+                "hr_algorithm": vs_lms_model.hr_algorithm,
+                "hr_params": dict(vs_lms_model.hr_params),
+            },
+            **vs_lms_cv,
         },
         "rls": {
             "model": rls_model,

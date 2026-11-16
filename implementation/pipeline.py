@@ -20,6 +20,8 @@ try:
     from .dataset_preparation import FS
     from .preprocessing import preprocess_signal
     from .LMS_algorithms import (
+        OPTIMAL_LMS_HR_CONFIG,
+        OPTIMAL_LMS_PARAMS,
         OPTIMAL_NLMS_HR_CONFIG,
         OPTIMAL_NLMS_PARAMS,
         OPTIMAL_VS_LMS_HR_CONFIG,
@@ -32,6 +34,8 @@ except ImportError:
     from dataset_preparation import FS
     from preprocessing import preprocess_signal
     from LMS_algorithms import (
+        OPTIMAL_LMS_HR_CONFIG,
+        OPTIMAL_LMS_PARAMS,
         OPTIMAL_NLMS_HR_CONFIG,
         OPTIMAL_NLMS_PARAMS,
         OPTIMAL_VS_LMS_HR_CONFIG,
@@ -163,32 +167,39 @@ class HeartRateEstimatorModel:
         self.fs = fs
 
     @classmethod
-    def from_project1_optimal(cls, algorithm: str, fs: float = FS) -> "HeartRateEstimatorModel":
-        """Instantiate `nlms` or `vs_lms` with the optimal hyperparameters obtained in Project 1."""
+    def from_project1_optimal(
+        cls, algorithm: str, fs: float = FS, **shared_overrides
+    ) -> "HeartRateEstimatorModel":
+        """Instantiate `lms`/`standard_lms`, `nlms`, or `vs_lms` with Project 1 optimal params.
+
+        Optional `**shared_overrides` (e.g. `delay_step`, `huber_c`, `warm_start_ratio`, or `M`)
+        are merged into `lms_params` to enable Option B feature-matched comparisons against RLS.
+        """
         key = algorithm.strip().lower().replace("-", "_")
-        if key == "nlms":
-            params = dict(OPTIMAL_NLMS_PARAMS)
-            M = int(params.pop("M"))
-            return cls(
-                lms_algorithm="nlms",
-                M=M,
-                lms_params=params,
-                hr_algorithm=OPTIMAL_NLMS_HR_CONFIG["hr_algorithm"],
-                hr_params=dict(OPTIMAL_NLMS_HR_CONFIG["hr_params"]),
-                fs=fs,
+        table = {
+            "lms": ("lms", OPTIMAL_LMS_PARAMS, OPTIMAL_LMS_HR_CONFIG),
+            "standard_lms": ("standard_lms", OPTIMAL_LMS_PARAMS, OPTIMAL_LMS_HR_CONFIG),
+            "nlms": ("nlms", OPTIMAL_NLMS_PARAMS, OPTIMAL_NLMS_HR_CONFIG),
+            "vs_lms": ("vs_lms", OPTIMAL_VS_LMS_PARAMS, OPTIMAL_VS_LMS_HR_CONFIG),
+            "vslms": ("vs_lms", OPTIMAL_VS_LMS_PARAMS, OPTIMAL_VS_LMS_HR_CONFIG),
+        }
+        if key not in table:
+            raise ValueError(
+                f"Project 1 optimal model only available for 'lms'/'standard_lms', 'nlms', or 'vs_lms', got '{algorithm}'."
             )
-        if key in ("vs_lms", "vslms"):
-            params = dict(OPTIMAL_VS_LMS_PARAMS)
-            M = int(params.pop("M"))
-            return cls(
-                lms_algorithm="vs_lms",
-                M=M,
-                lms_params=params,
-                hr_algorithm=OPTIMAL_VS_LMS_HR_CONFIG["hr_algorithm"],
-                hr_params=dict(OPTIMAL_VS_LMS_HR_CONFIG["hr_params"]),
-                fs=fs,
-            )
-        raise ValueError(f"Project 1 optimal model only available for 'nlms' or 'vs_lms', got '{algorithm}'.")
+
+        algo_name, base_params, hr_cfg = table[key]
+        params = dict(base_params)
+        params.update({k: v for k, v in shared_overrides.items() if v is not None})
+        M = int(params.pop("M"))
+        return cls(
+            lms_algorithm=algo_name,
+            M=M,
+            lms_params=params,
+            hr_algorithm=hr_cfg["hr_algorithm"],
+            hr_params=dict(hr_cfg["hr_params"]),
+            fs=fs,
+        )
 
     def reconstruct_window(
         self, window_5d: np.ndarray, return_details: bool = False

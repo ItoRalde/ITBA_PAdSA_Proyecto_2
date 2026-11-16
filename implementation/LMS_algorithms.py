@@ -1,5 +1,5 @@
 """
-Adaptive MISO filtering algorithms (Re-Architected RLS, NLMS, and VS-LMS) and Late Fusion bucket.
+Adaptive MISO filtering algorithms (Re-Architected RLS, LMS, NLMS, and VS-LMS) and Late Fusion bucket.
 
 Implements the adaptive filtering stage of the PPG heart signal reconstruction pipeline:
 - Primary input `d[n]`: Preprocessed PPG channel (`s[n] + m[n]`, cardiac signal + motion artifact).
@@ -9,24 +9,27 @@ Implements the adaptive filtering stage of the PPG heart signal reconstruction p
 - Cleared cardiac signal (a priori error / innovation output):
       e[n] = d[n] - m_hat[n] = s[n] + m[n] - w^T[n] a[n]
 
+Option B (Feature-Matched Comparison):
+To ensure a strictly fair comparison between RLS and the LMS family, all four adaptive filters
+(`rls`, `standard_lms`/`lms`, `nlms`, and `vs_lms`) support the same structural pipeline features:
+- `delay_step`: Tap dilation stride `D >= 1` breaking narrowband `[0.5, 4.0] Hz` collinearity.
+- `huber_c`: Huber M-estimator robust innovation clipping protecting `w[n]` against impulsive spikes.
+- `warm_start_ratio`: Strictly intra-window reverse-time warm-up pass eliminating cold-start
+  transients at `n = 0` without cross-window state propagation.
+
 Includes:
 1. `rls`: Re-architected Recursive Least Squares (RLS) MISO adaptive filter with all hyperparameters
-   tunable:
-   - `M`: Filter taps per accelerometer axis (total MISO taps `L = 3 * M`).
-   - `delay_step`: Tap dilation stride `D >= 1` breaking narrowband `[0.5, 4.0] Hz` collinearity
-     and expanding temporal aperture `T_aperture = (M - 1) * D / fs`.
-   - `lam` / `N_eff`: Exponential forgetting factor `lam = 1 - 1 / N_eff`.
-   - `delta`: Dimension-invariant regularization `P[0] = (delta * L)^{-1} I_L`.
-   - `diag_load`: Persistent diagonal shrinkage preventing null-space covariance blowup when `lam < 1`.
-   - `huber_c`: Huber M-estimator robust innovation clipping protecting `w[n]` against impulsive spikes.
-   - `warm_start_ratio`: Strictly intra-window reverse-time warm-up pass eliminating cold-start
-     transients at `n = 0` without cross-window state propagation.
-2. `nlms`: Normalized MISO LMS configured with the optimal hyperparameters obtained in Project 1
-   (`M = 22`, `mu = 0.01288`, `delta = 0.5`).
-3. `vs_lms`: Variable Step-Size MISO LMS configured with the optimal hyperparameters obtained in Project 1
-   (`M = 18`, `mu_max = 0.06558`, `mu_min = 0.00791`, `alpha = 0.98503`, `gamma = 0.00053`, `delta = 1.0`).
-4. `lms_bucket`: Bucket function that runs the selected adaptive filter (`rls`, `nlms`, or `vs_lms`)
-   in parallel on `ppg1` and `ppg2` and fuses the resulting error signals via `snr_weighted_late_fusion`.
+   tunable (`M`, `delay_step`, `lam` / `N_eff`, `delta`, `diag_load`, `huber_c`, `warm_start_ratio`).
+2. `standard_lms` (`lms`): Standard MISO LMS configured with the optimal step size obtained in
+   Project 1 (`M = 11`, `mu = 0.00070`) plus Option B structural parameters.
+3. `nlms`: Normalized MISO LMS configured with the optimal hyperparameters obtained in Project 1
+   (`M = 22`, `mu = 0.01288`, `delta = 0.5`) plus Option B structural parameters.
+4. `vs_lms`: Variable Step-Size MISO LMS configured with the optimal hyperparameters obtained in Project 1
+   (`M = 18`, `mu_max = 0.06558`, `mu_min = 0.00791`, `alpha = 0.98503`, `gamma = 0.00053`, `delta = 1.0`)
+   plus Option B structural parameters.
+5. `lms_bucket`: Bucket function that runs the selected adaptive filter (`rls`, `lms`/`standard_lms`,
+   `nlms`, or `vs_lms`) in parallel on `ppg1` and `ppg2` and fuses the resulting error signals via
+   `snr_weighted_late_fusion`.
 """
 
 import numpy as np
@@ -44,6 +47,15 @@ DIV_THR: float = 1e3
 # ============================================================================
 # Optimal Hyperparameters Obtained in Project 1 (5-Fold Subject-Wise GroupKFold)
 # ============================================================================
+OPTIMAL_LMS_PARAMS: dict = {
+    "M": 11,
+    "mu": 0.00070,
+}
+OPTIMAL_LMS_HR_CONFIG: dict = {
+    "hr_algorithm": "periodogram",
+    "hr_params": {"nfft": 4096, "window_type": "hamming"},
+}
+
 OPTIMAL_NLMS_PARAMS: dict = {
     "M": 22,
     "mu": 0.01288,
@@ -94,6 +106,99 @@ def _resolve_rls_forgetting(
     return lam_val
 
 
+def _huber_clip(
+    e_n: float, sigma_e_sq: float, huber_thr: float, use_huber: bool
+) -> tuple[float, float]:
+    """Apply recursive Huber M-estimator clipping to innovation `e_n` and update scale."""
+    if not use_huber:
+        return e_n, sigma_e_sq
+    bound = huber_thr * np.sqrt(sigma_e_sq)
+    e_upd = bound if e_n > bound else (-bound if e_n < -bound else e_n)
+    sigma_e_sq_next = 0.98 * sigma_e_sq + 0.02 * (e_upd * e_upd)
+    return e_upd, sigma_e_sq_next
+
+
+def _run_lms_family(
+    d: np.ndarray,
+    U: np.ndarray,
+    step_weights: np.ndarray | None,
+    fixed_mu: float | None = None,
+    vs_params: tuple[float, float, float, float] | None = None,
+    huber_c: float | None = None,
+    warm_start_ratio: float = 0.0,
+    w_init: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Shared Option B execution engine for `standard_lms`, `nlms`, and `vs_lms`.
+
+    Supports intra-window reverse-time warm-starting (`warm_start_ratio`) and
+    Huber M-estimator innovation clipping (`huber_c`) identically to `rls`.
+    """
+    N, L = U.shape
+    use_huber = huber_c is not None and float(huber_c) > 0.0
+    huber_thr = float(huber_c) if use_huber else 0.0
+
+    w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
+    dot = np.dot
+
+    if vs_params is not None:
+        mu_max, effective_mu_min, alpha, gamma = vs_params
+        mu_n = mu_max
+    else:
+        mu_max = effective_mu_min = alpha = gamma = 0.0
+        mu_n = 0.0
+
+    # Intra-window reverse-time warm-start pass (strictly within the current isolated window)
+    n_warm = int(round(float(warm_start_ratio) * N)) if w_init is None else 0
+    if n_warm > 1:
+        n_warm = min(N, n_warm)
+        sigma_e_sq = 1.0
+        for n in range(n_warm - 1, -1, -1):
+            a_n = U[n]
+            e_n = d[n] - float(dot(w, a_n))
+            if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
+                w.fill(0.0)
+                if vs_params is not None:
+                    mu_n = mu_max
+                break
+            e_upd, sigma_e_sq = _huber_clip(e_n, sigma_e_sq, huber_thr, use_huber)
+            if vs_params is not None:
+                w += (mu_n * step_weights[n] * e_upd) * a_n
+                mu_next = alpha * mu_n + gamma * (e_upd * e_upd)
+                mu_n = mu_max if mu_next > mu_max else (effective_mu_min if mu_next < effective_mu_min else mu_next)
+            elif step_weights is not None:
+                w += (step_weights[n] * e_upd) * a_n
+            else:
+                w += (fixed_mu * e_upd) * a_n
+
+    e = np.empty(N, dtype=float)
+    m_hat = np.empty(N, dtype=float)
+    sigma_e_sq = 1.0
+
+    for n in range(N):
+        a_n = U[n]
+        m_n = float(dot(w, a_n))
+        e_n = d[n] - m_n
+        m_hat[n] = m_n
+        e[n] = e_n
+
+        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
+            e[n:] = np.nan
+            m_hat[n:] = np.nan
+            break
+
+        e_upd, sigma_e_sq = _huber_clip(e_n, sigma_e_sq, huber_thr, use_huber)
+        if vs_params is not None:
+            w += (mu_n * step_weights[n] * e_upd) * a_n
+            mu_next = alpha * mu_n + gamma * (e_upd * e_upd)
+            mu_n = mu_max if mu_next > mu_max else (effective_mu_min if mu_next < effective_mu_min else mu_next)
+        elif step_weights is not None:
+            w += (step_weights[n] * e_upd) * a_n
+        else:
+            w += (fixed_mu * e_upd) * a_n
+
+    return e, m_hat, w
+
+
 # ============================================================================
 # 1. Re-Architected Recursive Least Squares (RLS) MISO Adaptive Filter
 # ============================================================================
@@ -106,7 +211,7 @@ def rls(
     delay_step: int = 2,
     N_eff: float | None = None,
     diag_load: float = 0.25,
-    huber_c: float = 2.5,
+    huber_c: float | None = 2.5,
     warm_start_ratio: float = 0.35,
     lambda_: float | None = None,
     w_init: np.ndarray | None = None,
@@ -170,13 +275,7 @@ def rls(
                 P.fill(0.0)
                 P[diag_idx] = p0_diag
                 break
-            if use_huber:
-                sigma_e = np.sqrt(sigma_e_sq)
-                bound = huber_thr * sigma_e
-                e_upd = bound if e_n > bound else (-bound if e_n < -bound else e_n)
-                sigma_e_sq = 0.98 * sigma_e_sq + 0.02 * (e_upd * e_upd)
-            else:
-                e_upd = e_n
+            e_upd, sigma_e_sq = _huber_clip(e_n, sigma_e_sq, huber_thr, use_huber)
 
             pi = dot(P, a_n)
             denom = lam_val + float(dot(a_n, pi))
@@ -209,13 +308,7 @@ def rls(
             m_hat[n:] = np.nan
             break
 
-        if use_huber:
-            sigma_e = np.sqrt(sigma_e_sq)
-            bound = huber_thr * sigma_e
-            e_upd = bound if e_n > bound else (-bound if e_n < -bound else e_n)
-            sigma_e_sq = 0.98 * sigma_e_sq + 0.02 * (e_upd * e_upd)
-        else:
-            e_upd = e_n
+        e_upd, sigma_e_sq = _huber_clip(e_n, sigma_e_sq, huber_thr, use_huber)
 
         pi = dot(P, a_n)
         denom = lam_val + float(dot(a_n, pi))
@@ -244,7 +337,7 @@ def _rls_dual_channel(
     delay_step: int = 2,
     N_eff: float | None = None,
     diag_load: float = 0.25,
-    huber_c: float = 2.5,
+    huber_c: float | None = 2.5,
     warm_start_ratio: float = 0.35,
     lambda_: float | None = None,
     w_init: np.ndarray | None = None,
@@ -309,17 +402,8 @@ def _rls_dual_channel(
                 P[diag_idx] = p0_diag
                 break
 
-            if use_huber:
-                b1 = huber_thr * np.sqrt(sig1_sq)
-                e1_upd = b1 if e1_n > b1 else (-b1 if e1_n < -b1 else e1_n)
-                sig1_sq = 0.98 * sig1_sq + 0.02 * (e1_upd * e1_upd)
-
-                b2 = huber_thr * np.sqrt(sig2_sq)
-                e2_upd = b2 if e2_n > b2 else (-b2 if e2_n < -b2 else e2_n)
-                sig2_sq = 0.98 * sig2_sq + 0.02 * (e2_upd * e2_upd)
-            else:
-                e1_upd = e1_n
-                e2_upd = e2_n
+            e1_upd, sig1_sq = _huber_clip(e1_n, sig1_sq, huber_thr, use_huber)
+            e2_upd, sig2_sq = _huber_clip(e2_n, sig2_sq, huber_thr, use_huber)
 
             pi = dot(P, a_n)
             denom = lam_val + float(dot(a_n, pi))
@@ -358,12 +442,8 @@ def _rls_dual_channel(
                 e1[n:] = np.nan
                 m_hat1[n:] = np.nan
                 alive1 = False
-            elif use_huber:
-                b1 = huber_thr * np.sqrt(sig1_sq)
-                e1_upd = b1 if e1_n > b1 else (-b1 if e1_n < -b1 else e1_n)
-                sig1_sq = 0.98 * sig1_sq + 0.02 * (e1_upd * e1_upd)
             else:
-                e1_upd = e1_n
+                e1_upd, sig1_sq = _huber_clip(e1_n, sig1_sq, huber_thr, use_huber)
 
         if alive2:
             m2_n = float(dot(w2, a_n))
@@ -374,12 +454,8 @@ def _rls_dual_channel(
                 e2[n:] = np.nan
                 m_hat2[n:] = np.nan
                 alive2 = False
-            elif use_huber:
-                b2 = huber_thr * np.sqrt(sig2_sq)
-                e2_upd = b2 if e2_n > b2 else (-b2 if e2_n < -b2 else e2_n)
-                sig2_sq = 0.98 * sig2_sq + 0.02 * (e2_upd * e2_upd)
             else:
-                e2_upd = e2_n
+                e2_upd, sig2_sq = _huber_clip(e2_n, sig2_sq, huber_thr, use_huber)
 
         if not alive1 and not alive2:
             break
@@ -410,7 +486,37 @@ def _rls_dual_channel(
 
 
 # ============================================================================
-# 2. Normalized MISO LMS (NLMS) — Optimal Hyperparameters from Project 1
+# 2. Standard MISO LMS (Option B Feature-Matched) — Optimal Project 1 Step Size
+# ============================================================================
+def standard_lms(
+    d: np.ndarray,
+    acc: np.ndarray,
+    M: int = OPTIMAL_LMS_PARAMS["M"],
+    mu: float = OPTIMAL_LMS_PARAMS["mu"],
+    delay_step: int = 1,
+    huber_c: float | None = None,
+    warm_start_ratio: float = 0.0,
+    my: float | None = None,
+    w_init: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Standard MISO LMS using Project 1 optimal parameters with Option B shared features."""
+    d = np.asarray(d, dtype=float)
+    N = len(d)
+    U = _prepare_regressor(acc, N, M, delay_step=delay_step)
+    step_mu = float(my if my is not None else mu)
+    return _run_lms_family(
+        d,
+        U,
+        step_weights=None,
+        fixed_mu=step_mu,
+        huber_c=huber_c,
+        warm_start_ratio=warm_start_ratio,
+        w_init=w_init,
+    )
+
+
+# ============================================================================
+# 3. Normalized MISO LMS (NLMS, Option B Feature-Matched) — Optimal Project 1 Params
 # ============================================================================
 def nlms(
     d: np.ndarray,
@@ -418,47 +524,33 @@ def nlms(
     M: int = OPTIMAL_NLMS_PARAMS["M"],
     mu: float = OPTIMAL_NLMS_PARAMS["mu"],
     delta: float = OPTIMAL_NLMS_PARAMS["delta"],
+    delay_step: int = 1,
+    huber_c: float | None = None,
+    warm_start_ratio: float = 0.0,
     w_init: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Normalized MISO Least Mean Squares (NLMS) adaptive filter using Project 1 optimal parameters.
+    """Normalized MISO LMS using Project 1 optimal parameters with Option B shared features.
 
-    Default hyperparameters correspond to the optimal 5-fold Group K-Fold configuration
-    obtained in Project 1 (`M = 22`, `mu = 0.01288`, `delta = 0.5`):
-        m_hat[n] = sum_{k=1}^{3} w_k^T[n] a_k[n] = w^T[n] a[n]
-        e[n]     = d[n] - m_hat[n]
-        w[n + 1] = w[n] + (mu / (delta + ||a[n]||^2)) * e[n] * a[n]
+    Default step hyperparameters correspond to the optimal 5-fold Group K-Fold configuration
+    obtained in Project 1 (`M = 22`, `mu = 0.01288`, `delta = 0.5`), while supporting matched
+    `delay_step`, `huber_c`, and `warm_start_ratio` for a fair Option B comparison with RLS.
     """
     d = np.asarray(d, dtype=float)
     N = len(d)
-    U = _prepare_regressor(acc, N, M)
-    L = U.shape[1]
-
+    U = _prepare_regressor(acc, N, M, delay_step=delay_step)
     inv_denom = float(mu) / (float(delta) + np.einsum("ij,ij->i", U, U))
-
-    w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
-    e = np.empty(N, dtype=float)
-    m_hat = np.empty(N, dtype=float)
-
-    dot = np.dot
-    for n in range(N):
-        a_n = U[n]
-        m_n = float(dot(w, a_n))
-        e_n = d[n] - m_n
-        m_hat[n] = m_n
-        e[n] = e_n
-
-        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
-            e[n:] = np.nan
-            m_hat[n:] = np.nan
-            break
-
-        w += (inv_denom[n] * e_n) * a_n
-
-    return e, m_hat, w
+    return _run_lms_family(
+        d,
+        U,
+        step_weights=inv_denom,
+        huber_c=huber_c,
+        warm_start_ratio=warm_start_ratio,
+        w_init=w_init,
+    )
 
 
 # ============================================================================
-# 3. Variable Step-Size MISO LMS (VS-LMS) — Optimal Hyperparameters from Project 1
+# 4. Variable Step-Size MISO LMS (VS-LMS, Option B Feature-Matched)
 # ============================================================================
 def vs_lms(
     d: np.ndarray,
@@ -469,59 +561,34 @@ def vs_lms(
     alpha: float = OPTIMAL_VS_LMS_PARAMS["alpha"],
     gamma: float = OPTIMAL_VS_LMS_PARAMS["gamma"],
     delta: float = OPTIMAL_VS_LMS_PARAMS["delta"],
+    delay_step: int = 1,
+    huber_c: float | None = None,
+    warm_start_ratio: float = 0.0,
     w_init: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Kwong-Johnston Variable Step-Size MISO LMS (VS-LMS) using Project 1 optimal parameters.
+    """Kwong-Johnston Variable Step-Size MISO LMS using Project 1 optimal params + Option B features.
 
-    Default hyperparameters correspond to the optimal 5-fold Group K-Fold configuration
+    Default step hyperparameters correspond to the optimal 5-fold Group K-Fold configuration
     obtained in Project 1 (`M = 18`, `mu_max = 0.06558`, `mu_min = 0.00791`,
-    `alpha = 0.98503`, `gamma = 0.00053`, `delta = 1.0`):
-        m_hat[n]  = sum_{k=1}^{3} w_k^T[n] a_k[n] = w^T[n] a[n]
-        e[n]      = d[n] - m_hat[n]
-        w[n + 1]  = w[n] + (mu[n] / (delta + ||a[n]||^2)) * e[n] * a[n]
-        mu[n + 1] = clip(alpha * mu[n] + gamma * e^2[n], mu_min, mu_max)
+    `alpha = 0.98503`, `gamma = 0.00053`, `delta = 1.0`), while supporting matched
+    `delay_step`, `huber_c`, and `warm_start_ratio` for a fair Option B comparison with RLS.
     """
     d = np.asarray(d, dtype=float)
     N = len(d)
-    U = _prepare_regressor(acc, N, M)
-    L = U.shape[1]
+    U = _prepare_regressor(acc, N, M, delay_step=delay_step)
 
     mu_max = float(mu_max)
     effective_mu_min = float(min(mu_min, mu_max * 0.5))
-    mu_n = mu_max
-    alpha = float(alpha)
-    gamma = float(gamma)
-
     inv_power = 1.0 / (float(delta) + np.einsum("ij,ij->i", U, U))
-
-    w = np.zeros(L, dtype=float) if w_init is None else np.array(w_init, dtype=float, copy=True)
-    e = np.empty(N, dtype=float)
-    m_hat = np.empty(N, dtype=float)
-
-    dot = np.dot
-    for n in range(N):
-        a_n = U[n]
-        m_n = float(dot(w, a_n))
-        e_n = d[n] - m_n
-        m_hat[n] = m_n
-        e[n] = e_n
-
-        if not np.isfinite(e_n) or abs(e_n) > DIV_THR:
-            e[n:] = np.nan
-            m_hat[n:] = np.nan
-            break
-
-        w += (mu_n * inv_power[n] * e_n) * a_n
-
-        mu_next = alpha * mu_n + gamma * (e_n * e_n)
-        if mu_next > mu_max:
-            mu_n = mu_max
-        elif mu_next < effective_mu_min:
-            mu_n = effective_mu_min
-        else:
-            mu_n = mu_next
-
-    return e, m_hat, w
+    return _run_lms_family(
+        d,
+        U,
+        step_weights=inv_power,
+        vs_params=(mu_max, effective_mu_min, float(alpha), float(gamma)),
+        huber_c=huber_c,
+        warm_start_ratio=warm_start_ratio,
+        w_init=w_init,
+    )
 
 
 # ============================================================================
@@ -529,6 +596,8 @@ def vs_lms(
 # ============================================================================
 LMS_REGISTRY: dict[str, callable] = {
     "rls": rls,
+    "lms": standard_lms,
+    "standard_lms": standard_lms,
     "nlms": nlms,
     "vs_lms": vs_lms,
     "vslms": vs_lms,
@@ -545,11 +614,11 @@ def lms_bucket(
     return_details: bool = False,
     **hyperparams,
 ) -> np.ndarray | tuple[np.ndarray, dict]:
-    """Bucket function to select an adaptive algorithm (`rls`, `nlms`, or `vs_lms`) and apply Late Fusion.
+    """Bucket function to select an adaptive algorithm (`rls`, `lms`/`standard_lms`, `nlms`, `vs_lms`) and apply Late Fusion.
 
     Executes Dual PPG Parallel Filtering + SNR-Weighted Late Fusion:
     1. Builds the shared 3-axis MISO regressor matrix `U = build_U(acc, M, delay_step)` of shape `(N, 3 * M)`.
-    2. Runs the chosen adaptive filter (`rls`, `nlms`, or `vs_lms`) on `ppg1` -> `e1` and `ppg2` -> `e2`.
+    2. Runs the chosen adaptive filter (`rls`, `standard_lms`/`lms`, `nlms`, or `vs_lms`) on `ppg1` -> `e1` and `ppg2` -> `e2`.
     3. Fuses `e1` and `e2` via `snr_weighted_late_fusion(e1, e2)` -> `e_fused`.
     """
     algo_key = algorithm.strip().lower().replace("-", "_")
@@ -561,6 +630,8 @@ def lms_bucket(
     if M is None:
         if "M" in params:
             M = int(params.pop("M"))
+        elif algo_key in ("lms", "standard_lms"):
+            M = OPTIMAL_LMS_PARAMS["M"]
         elif algo_key == "nlms":
             M = OPTIMAL_NLMS_PARAMS["M"]
         elif algo_key in ("vs_lms", "vslms"):
@@ -580,7 +651,6 @@ def lms_bucket(
             ppg1, ppg2, U, M=M, w_init=w_init, **params
         )
     else:
-        params.pop("delay_step", None)
         lms_fn = LMS_REGISTRY[algo_key]
         e1, m_hat1, w1 = lms_fn(ppg1, U, M=M, w_init=w_init, **params)
         e2, m_hat2, w2 = lms_fn(ppg2, U, M=M, w_init=w_init, **params)
