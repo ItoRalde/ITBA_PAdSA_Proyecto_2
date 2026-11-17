@@ -1,0 +1,342 @@
+================================================================================
+SECTION 1: PRESENTATION SCRIPT — SLIDES 1 TO 8
+Estimated Speaking Duration: ~10–11 Minutes (~1,640 spoken words)
+================================================================================
+
+--------------------------------------------------------------------------------
+SLIDE 1 — Title Slide (~0:20 | ~50 words)
+--------------------------------------------------------------------------------
+Good morning everyone. Today we present Project 2, where we perform motion
+artifact cancellation in wrist-worn photoplethysmography—or PPG—signals to
+estimate heart rate during intense exercise. Specifically, we replace Project 1's
+LMS filters with Recursive Least Squares (RLS), diagnose and fix its failure
+modes, and compare both families under equal conditions.
+
+--------------------------------------------------------------------------------
+SLIDE 2 — Presentation Outline (~0:30 | ~75 words)
+--------------------------------------------------------------------------------
+Our presentation has five parts. First, we briefly review PPG motion artifacts
+and how RLS fits into adaptive cancellation. Second, we walk through the RLS
+hyperparameters and the pipeline improvements we added relative to Project 1.
+Third, we show RLS test performance and examine windows that no linear filter
+can recover. Fourth, we introduce a Signal Quality Index (SQI) to handle
+unrecoverable segments and run a fair comparison. Finally, we conclude.
+
+--------------------------------------------------------------------------------
+SLIDE 3 — Topic Review: PPG & Adaptive Interference Cancellation (~0:50 | ~125 words)
+--------------------------------------------------------------------------------
+Let's recap the physical setup. A wrist-worn PPG sensor shines green LED light
+into the skin and measures reflected intensity with a photodiode. As blood
+volume pulses with each heartbeat, light absorption changes, revealing the heart
+rate. During exercise, however, wrist movement shifts the optical path and
+injects strong motion artifacts directly inside the cardiac frequency band.
+
+To cancel this interference, we use the adaptive noise cancellation scheme on
+the right. The PPG channel is the primary input: it holds the clean pulse plus
+motion noise. The three-axis accelerometer provides reference signals that
+correlate with wrist movement, not with the heartbeat. Our adaptive filter—now
+RLS—estimates the motion noise from the accelerometer and subtracts it from the
+PPG, leaving the cleaned cardiac signal as the error output e[n].
+
+--------------------------------------------------------------------------------
+SLIDE 4 — Pipeline: How the Code Works (~1:10 | ~180 words)
+--------------------------------------------------------------------------------
+Every 8-second window contains 1,000 samples at 125 Hz and is processed
+completely independently—no filter state or weights carry over from one window
+to the next. The pipeline has five steps:
+
+1. Preprocessing: Both PPG channels and all three accelerometer axes pass
+   through a zero-phase 4th-order Butterworth bandpass filter from 0.5 to 4 Hz
+   (30 to 240 BPM), removing baseline drift and out-of-band noise. Each channel
+   is then normalized to zero mean and unit variance.
+2. Regressors: We stack the past M delayed samples of the three accelerometer
+   axes into a regressor matrix U of size N by 3M, zero-padded before n = 0.
+3. Parallel Filtering: Because the dataset has two wrist PPG sensors, we filter
+   PPG 1 and PPG 2 in parallel against the accelerometer using the same algorithm
+   and hyperparameters.
+4. SNR-Weighted Late Fusion: We combine both cleaned outputs using weights
+   proportional to each branch's in-band spectral SNR, automatically trusting
+   the cleaner sensor.
+5. BPM Estimation: Finally, we take the dominant peak of a zero-padded
+   periodogram in 0.5 to 4 Hz. We also tested Elgendi's peak detector in our
+   search loop, and the periodogram consistently won.
+
+--------------------------------------------------------------------------------
+SLIDE 5 — Optimizing RLS: LMS vs. RLS (~0:50 | ~130 words)
+--------------------------------------------------------------------------------
+Why move from LMS to RLS? Look at the difference between the two methods.
+
+LMS—and its Project 1 variants NLMS and VS-LMS—updates its weights using only
+the instantaneous gradient at the current sample. That is simple and cheap,
+O(L) operations per sample where L = 3M. However, when the input lags are
+strongly correlated, gradient descent zig-zags and converges slowly. Since each
+window is only 8 seconds long and starts cold from zero weights, slow
+convergence hurts accuracy.
+
+RLS instead solves a deterministic weighted least-squares problem at every
+sample, choosing the weights that minimize the accumulated squared error over
+all samples seen so far in the window. Using the inverse correlation matrix
+P(n), RLS whitens the input directions and achieves much faster, Newton-like
+convergence—at a higher cost of O(L^2) per sample.
+
+--------------------------------------------------------------------------------
+SLIDE 6 — How RLS Works: Forgetting Factor & P(n) (~0:55 | ~140 words)
+--------------------------------------------------------------------------------
+More specifically, RLS minimizes an exponentially weighted sum of squared
+errors: the most recent sample has weight 1, and older samples decay as lambda,
+lambda^2, lambda^3, and so on.
+
+The forgetting factor lambda sets the memory of the filter. When lambda is
+close to 1, RLS averages over almost the whole 8-second window, giving stable,
+low-variance weights. When lambda is smaller, RLS forgets older samples faster
+and tracks sudden changes in motion better, at the price of noisier weights.
+
+The matrix P(n) recursively tracks the inverse of the weighted input correlation
+matrix Phi(n). Crucially, Phi(n) and P(n) depend only on the accelerometer
+reference a(n), not on the PPG signal. By multiplying the error by P(n) * a(n),
+RLS rescales each direction according to how much motion energy occurred along
+it, eliminating the zig-zagging that slows down LMS.
+
+--------------------------------------------------------------------------------
+SLIDE 7 — Parameters We Study (~0:45 | ~115 words)
+--------------------------------------------------------------------------------
+In standard textbook RLS, there are three parameters to optimize via 5-fold
+subject-wise Group K-Fold cross-validation:
+
+1. M: the filter order per accelerometer axis (total weights L = 3M).
+2. Lambda: the forgetting factor controlling effective memory.
+3. Delta: the initial regularization setting P(0) = (1/delta)*I.
+
+However, when we tested naive textbook RLS, it barely matched Project 1's
+VS-LMS and hit severe numerical issues: our Bayesian TPE optimizer pushed
+lambda right up against its upper limit (0.9999) and delta down against its
+lower limit (0.01). Fixing why that happened led directly to the four
+improvements on Slide 8.
+
+--------------------------------------------------------------------------------
+SLIDE 8 — Additional Pipeline Improvements Relative to Project 1 (~4:40 | ~720 words)
+--------------------------------------------------------------------------------
+Let's go carefully through the four improvements on Slide 8, because they fix
+bottlenecks we saw in Project 1 and explain why our final comparison is fair.
+
+Improvement 1: Dilated Taps (delay_step = D).
+In Project 1, our regressor took consecutive samples, D = 1, at 125 Hz. Why is
+that bad? Because our signals are bandpass-filtered to 0.5–4 Hz, they are
+oversampled more than 15 times—consecutive samples are over 98.5% identical.
+That extreme correlation makes the input correlation matrix nearly singular: a
+few eigenvalues are large, while most are almost zero (around 10^-7 or smaller),
+giving a condition number above 10^6. For LMS, gradient descent stalls along
+those tiny-eigenvalue directions. For RLS, it is even worse: P(n) inverts that
+correlation matrix, so dividing by near-zero eigenvalues blows up numerical
+noise into huge weight errors. At the same time, 15 consecutive samples only
+span 112 milliseconds—shorter than a quarter cycle of a running stride. By
+spacing taps by D = 4 samples (32 milliseconds apart) and using M = 7 taps,
+adjacent taps are genuinely distinct, the condition number drops dramatically,
+we need only 21 weights instead of 45, and our filter spans nearly 200 milliseconds.
+
+Improvement 2: Huber Robust Innovation Clipping (huber_c).
+In Project 1, we saw severe outliers like Window #481, where a sudden impact
+caused an enormous error spike. In adaptive filtering, "innovation" means the
+prediction error e[n] = d[n] - m_hat[n]—the part of the PPG not predicted from
+the accelerometer. Importantly, we do NOT clip the output PPG signal: unclipped
+e[n] goes straight to the periodogram. Instead, in the code, we track a running
+standard deviation of the error and compute a clipped copy, e_upd, capped at
++/- 2.5 standard deviations, using only e_upd to update the weights.
+
+You might ask: doesn't the spike stay in lambda's memory, or doesn't clipping
+slow down real adaptation? The answer to both is no. First, the correlation
+matrix P(n) only stores the accelerometer a(n), never the PPG d(n). Past PPG
+information lives only in the weight vector w(n)—so clipping e_upd stops the
+spike from ever entering w(n) in the first place, preventing a mid-window shock
+from throwing the weights off course for hundreds of samples. Second, if motion
+genuinely changes, the error persists across many consecutive samples: every
+step still pulls w(n) toward the new regime, P(n) and k(n) stay unclipped to
+track the new accelerometer energy, and the running error scale adapts upward.
+It simply ignores single-sample heavy-tailed shocks.
+
+Improvement 3: Scaled Initialization, Diagonal Loading, and Effective Memory.
+In textbook RLS, two issues forced TPE to pin lambda -> 1 and delta -> 0.01.
+First, textbook regularization enters the cost as delta * lambda^(n+1) * I,
+which fades away exponentially when lambda < 1. Along any unexcited null-space
+direction of the accelerometer—where a^T(n)*v is nearly zero—the update
+P(n+1) = (1/lambda)*(P(n) - k(n)*a^T(n)*P(n)) subtracts nothing and simply
+multiplies that eigenvalue by 1/lambda > 1 at every sample! So when lambda < 1,
+null-space entries of P(n) blow up exponentially as (1/lambda)^n. Second, even
+though the heartbeat isn't in the accelerometer, over a very short effective
+memory (like 50 samples = 0.4 s at lambda = 0.98), two narrowband 0.5–4 Hz
+waves overlap purely by chance—so with 45 weights, RLS can cancel part of the
+pulse. To avoid both failures, TPE pinned lambda -> 1; and once lambda ~ 1,
+initial delta never decays, forcing TPE to pin delta -> 0.01.
+
+We fixed all three together: (a) we scale P(0) = 1 / (delta * 3M) * I by the
+expected input power 3M so delta has the same meaning for any M; (b) we apply
+persistent diagonal loading (diag_load), gently shrinking P(n) back toward
+P(0)*I at every step so null-space growth is damped and bounded without forcing
+lambda = 1; and (c) we optimize effective memory N_eff = 1/(1 - lambda) on a log
+scale instead of lambda linearly, yielding an interior optimum (N_eff = 1409,
+delta = 5.11).
+
+Improvement 4: Fair Comparison ("Option B").
+Dilated taps and Huber clipping help the whole pipeline, not just RLS. So we
+applied the exact same delay_step = 4 and huber_c = 2.50 to LMS, NLMS, and
+VS-LMS—while keeping their Project 1 optimal step sizes and filter orders fixed,
+without retraining them.
+
+That explains why Standard LMS suddenly beats VS-LMS on test (13.09 vs. 13.94
+BPM AAE), even though VS-LMS still wins in cross-validation (4.20 vs. 5.18 BPM).
+Once D = 4 decorrelates the input and Huber clipping removes spikes, Standard
+LMS—with 33 weights and a tiny fixed step (mu = 0.0007)—is very stable. Meanwhile,
+VS-LMS was not re-tuned for D = 4; its five D = 1 parameters and error-driven
+step-size boost over-react on harder unseen test subjects. Next, let's see how
+RLS performs against this strengthened baseline.
+
+
+================================================================================
+SECTION 2: RLS THEORY & TECHNICAL Q&A REFERENCE (For Presenter Preparation)
+================================================================================
+
+--------------------------------------------------------------------------------
+A. Core RLS Theory (From Cost Function to Recursive Update)
+--------------------------------------------------------------------------------
+1. Objective Function:
+   At sample n, RLS finds the single weight vector w that minimizes the
+   exponentially weighted deterministic least-squares cost over all samples
+   i = 0, ..., n in the current window:
+
+       J[n] = sum_{i=0}^{n} lambda^{n - i} (d[i] - w^T a[i])^2
+              + delta * lambda^{n + 1} ||w||^2
+
+   Here:
+   - d[i] is the preprocessed PPG signal,
+   - a[i] is the 3M-dimensional accelerometer regressor vector,
+   - lambda in (0, 1] is the forgetting factor (effective memory N_eff = 1/(1 - lambda)),
+   - delta > 0 is the initial ridge regularization weight.
+
+2. Normal Equations:
+   Setting grad_w J[n] = 0 gives the linear system:
+
+       Phi[n] * w[n + 1] = z[n]
+
+   where:
+       Phi[n] = sum_{i=0}^{n} lambda^{n - i} a[i] a^T[i]  +  delta * lambda^{n + 1} I
+       z[n]   = sum_{i=0}^{n} lambda^{n - i} a[i] d[i]
+
+   Notice that Phi[n] depends ONLY on the accelerometer vectors a[i], whereas
+   d[i] enters ONLY through z[n] (and recursively through w[n]).
+
+3. Recursive Matrix Inversion Lemma (Woodbury Identity):
+   Inverting Phi[n] directly takes O(L^3) per sample. Defining P[n] = Phi^{-1}[n - 1]
+   with P[0] = (1 / delta) * I gives the exact O(L^2) recursion:
+     - A priori error (innovation):  e[n] = d[n] - w^T[n] a[n]
+     - Gain vector:                  k[n] = P[n] a[n] / (lambda + a^T[n] P[n] a[n])
+     - Weight update:                w[n + 1] = w[n] + k[n] * e[n]
+     - Inverse correlation update:   P[n + 1] = (1 / lambda) * (P[n] - k[n] a^T[n] P[n])
+
+--------------------------------------------------------------------------------
+B. Where Naive RLS Improves Over LMS vs. Where It Fails
+--------------------------------------------------------------------------------
+- Where RLS Improves Over LMS:
+  LMS takes steps along the raw gradient e[n] * a[n]. If a[n] has very uneven
+  energy across eigendirections, LMS converges rapidly in high-energy modes and
+  crawls in low-energy modes. RLS multiplies by P[n] = Phi^{-1}, which acts like
+  a Newton pre-conditioner: it equalizes step sizes across all excited
+  eigendirections and converges in ~2L samples instead of hundreds of samples.
+
+- Where Naive RLS Fails on Isolated 8-Second Bandlimited PPG Windows:
+  1) Extreme Collinearity (D = 1 at 125 Hz in 0.5–4 Hz):
+     The input occupies only 5.6% of the Nyquist band, so consecutive samples
+     are >98.5% correlated (condition number > 10^6). Inverting nearly singular
+     Phi[n] amplifies noise in weak eigenmodes. (Fixed by delay_step = D.)
+  2) Null-Space Blowup When lambda < 1:
+     See Section C below. (Fixed by diag_load + N_eff.)
+  3) Finite-Window Heartbeat Cancellation:
+     Over short effective memory N_eff (e.g., 50 samples = 0.4 s at lambda = 0.98),
+     the uncorrelated heartbeat s[n] and accelerometer a[n] share the same
+     0.5–4 Hz band and exhibit non-zero sample cross-correlation by chance.
+     With L = 45 free weights, RLS uses excess degrees of freedom to fit and
+     cancel s[n]. (Fixed by fewer taps M=7 + log-scale N_eff ~ 1409.)
+  4) Quadratic Sensitivity to Impulsive Motion Shocks:
+     Because J[n] is an L2 squared loss, a sudden sensor detachment spike
+     creates a massive e[n] that kicks w[n + 1] far from the true motion path,
+     and once P[n] has shrunk (O(1/n)), recovery takes hundreds of samples.
+     (Fixed by huber_c; note that on completely saturated windows where the
+     cardiac peak disappears—e.g. Window #481—no linear filter can recover BPM.)
+
+--------------------------------------------------------------------------------
+C. Diagonal Loading & Why lambda < 1 Blows Up Null-Space Directions
+--------------------------------------------------------------------------------
+1. How Regularization Was NOT Equal Before (Textbook vs. Persistent):
+   In textbook RLS, the regularization term in Phi[n] is delta * lambda^{n+1} * I.
+   Because lambda < 1, that diagonal loading decays to ZERO exponentially as n
+   grows (e.g., at lambda = 0.98 and n = 300, 0.98^300 = 0.0023). It is NOT
+   persistent—it only exists at the very start of the window.
+
+2. Why Unexcited Null-Space Directions Blow Up When lambda < 1:
+   Let v_q be an eigenvector in the unexcited null space of the accelerometer
+   where a^T[n] v_q ~= 0. Look at the textbook P[n] recursion:
+       P[n + 1] v_q = (1 / lambda) * (P[n] v_q - k[n] * (a^T[n] P[n] v_q))
+   Because a^T[n] v_q ~= 0 (since P[n] v_q aligns with v_q), the subtracted
+   rank-1 term is zero, leaving:
+       v_q^T P[n + 1] v_q  ~=  (1 / lambda) * (v_q^T P[n] v_q)
+                           ~=  (1 / delta) * (1 / lambda)^n  ->  infinity!
+   Because 1/lambda > 1, every single sample inflates unexcited eigenvalues of P[n]
+   exponentially. That forces TPE to push lambda -> 1.0 (to keep 1/lambda ~= 1).
+   And once lambda ~= 1, initial delta * I never decays, so large delta
+   permanently shrinks weights toward zero—forcing TPE to push delta -> 0.01.
+
+3. What Persistent Diagonal Loading (diag_load) Does:
+   "Diagonal loading" means continuously adding a positive floor to the diagonal
+   of Phi[n] (or shrinking P[n] back toward its prior P_0 * I = 1/(delta*3M) * I
+   on every step):
+       P[n + 1] = (1 - tau) * P_tilde[n + 1] + tau * P_0 * I
+   with tau = (1 - lambda) * diag_load. Along an unexcited direction v_q, the
+   growth factor changes from 1/lambda to (1 - tau)/lambda (reaching exact
+   neutrality = 1.0 when diag_load = 1.0, and damping growth while re-anchoring
+   the diagonal toward P_0 for 0 < diag_load < 1). In our ablation on 300
+   training windows, removing diag_load worsened median error from 0.84 to 0.99 BPM.
+
+--------------------------------------------------------------------------------
+D. How Huber Innovation Clipping Changes RLS Theory & Why Adaptation Still Works
+--------------------------------------------------------------------------------
+1. Does the Bad Spike Stay in lambda's Memory?
+   NO. Remember the two parts of RLS:
+   - Phi[n] (and P[n] = Phi^{-1}) accumulates ONLY the accelerometer input a[i]:
+         Phi[n] = sum lambda^{n-i} a[i] a^T[i] + ...
+     The PPG spike d[n_0] is NEVER inside P[n] or lambda's correlation memory!
+   - Target PPG information enters ONLY through the weight update:
+         w[n + 1] = w[n] + k[n] * e_upd[n]
+     Without clipping, a 20*sigma spike in d[n_0] creates a huge jump in w[n_0+1],
+     and THAT corrupted weight jump persists in w[n] for hundreds of samples.
+     With Huber clipping (e_upd = clip(e[n], +/- 2.5 * sigma_e[n])), the spike is
+     blocked BEFORE entering w[n], corresponding theoretically to replacing L2
+     quadratic loss with a robust Huber M-estimator loss (quadratic for small
+     errors, linear/bounded gradient for outliers). Meanwhile, unclipped e[n] is
+     still returned as the output signal.
+
+2. Why Doesn't Clipping Degrade Genuine Adaptation?
+   - P[n] and the Kalman gain k[n] are NEVER clipped, so sudden changes in
+     accelerometer energy a[n] immediately update the gain geometry.
+   - A true change in the motion transfer function produces a SUSTAINED error
+     over many consecutive samples (not a single isolated spike). Even when
+     capped at +/- 2.5*sigma_e, every sample pulls w[n] in the right direction,
+     and the running scale tracker (sigma_e^2 = 0.98*sigma_e^2 + 0.02*e_upd^2)
+     gradually expands to match sustained higher error.
+   - Trade-off: If a legitimate, huge step-change in motion path occurs mid-window,
+     Huber clipping slightly slows the first few samples of re-convergence
+     (trading a tiny bit of step-response speed for immunity against outliers).
+     In our 300-window training ablation, RLS with and without Huber both scored
+     3.57 BPM AAE, showing it costs nothing on typical windows while protecting
+     against heavy-tailed test spikes.
+
+--------------------------------------------------------------------------------
+E. Was VS-LMS Retrained for the New Pipeline?
+--------------------------------------------------------------------------------
+- NO. Under Project 2's Option B protocol, only RLS was optimized on the new
+  pipeline. Standard LMS, NLMS, and VS-LMS kept their exact Project 1 optimal
+  step sizes and filter orders (tuned in Project 1 for D = 1 without Huber),
+  and were evaluated with RLS's delay_step = 4 and huber_c = 2.50149.
+- Consequently, VS-LMS's five reactive parameters (M=18, mu_max=0.06558, etc.)
+  were never re-tuned for D = 4, which helps explain why it improved on CV
+  (4.56 -> 4.20 BPM) yet trailed Standard LMS (M=11, mu=0.00070) on the unseen
+  test set (13.94 vs. 13.09 BPM).
+================================================================================

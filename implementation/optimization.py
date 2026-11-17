@@ -79,24 +79,55 @@ except ImportError:
     from pipeline import HeartRateEstimatorModel
 
 # Maximum filter taps per axis and maximum dilation stride for precomputing the delay tensor
-MAX_M: int = 18
+MAX_M: int = 22
 MAX_DELAY_STEP: int = 4
 MAX_LAG: int = MAX_M * MAX_DELAY_STEP
 
 # ============================================================================
-# Conditional Tree Hyperparameter Search Space Definition (Re-Architected RLS + HR)
+# Conditional Tree Hyperparameter Search Space Definition (RLS, NLMS, VS-LMS, LMS + HR)
 # ============================================================================
+_RLS_SUBSPACE: dict = {
+    "M": ("int", 6, 18),
+    "delay_step": ("choice", [1, 2, 3, 4]),
+    "N_eff": ("log_float", 150.0, 2500.0),
+    "delta": ("log_float", 0.05, 10.0),
+    "diag_load": ("log_float", 0.05, 1.0),
+    "huber_c": ("float", 1.5, 4.0),
+    "warm_start_ratio": ("choice", [0.0, 0.25, 0.5]),
+}
+
 CONDITIONAL_SEARCH_SPACE: dict = {
-    "lms_algorithm": ["rls"],
+    "lms_algorithm": ["nlms", "vs_lms", "rls"],
     "hr_algorithm": ["periodogram", "elgendi"],
-    "rls_subspace": {
-        "M": ("int", 6, MAX_M),
-        "delay_step": ("choice", [1, 2, 3, 4]),
-        "N_eff": ("log_float", 150.0, 2500.0),
-        "delta": ("log_float", 0.05, 10.0),
-        "diag_load": ("log_float", 0.05, 1.0),
-        "huber_c": ("float", 1.5, 4.0),
-        "warm_start_ratio": ("choice", [0.0, 0.25, 0.5]),
+    "rls_subspace": _RLS_SUBSPACE,
+    "lms_subspaces": {
+        "rls": _RLS_SUBSPACE,
+        "lms": {
+            "M": ("int", 6, MAX_M),
+            "delay_step": ("choice", [1, 2, 3, 4]),
+            "mu": ("log_float", 1e-4, 3e-3),
+            "huber_c": ("float", 1.5, 4.0),
+            "warm_start_ratio": ("choice", [0.0, 0.25, 0.5]),
+        },
+        "nlms": {
+            "M": ("int", 6, MAX_M),
+            "delay_step": ("choice", [1, 2, 3, 4]),
+            "mu": ("log_float", 0.005, 0.25),
+            "delta": ("log_float", 0.1, 5.0),
+            "huber_c": ("float", 1.5, 4.0),
+            "warm_start_ratio": ("choice", [0.0, 0.25, 0.5]),
+        },
+        "vs_lms": {
+            "M": ("int", 6, MAX_M),
+            "delay_step": ("choice", [1, 2, 3, 4]),
+            "mu_max": ("log_float", 0.01, 0.25),
+            "mu_min": ("log_float", 0.0005, 0.02),
+            "alpha": ("float", 0.94, 0.995),
+            "gamma": ("log_float", 1e-4, 5e-3),
+            "delta": ("log_float", 0.2, 5.0),
+            "huber_c": ("float", 1.5, 4.0),
+            "warm_start_ratio": ("choice", [0.0, 0.25, 0.5]),
+        },
     },
     "hr_subspaces": {
         "periodogram": {
@@ -109,6 +140,22 @@ CONDITIONAL_SEARCH_SPACE: dict = {
             "beta_offset": ("float", 0.01, 0.08),
         },
     },
+}
+
+PROJECT2_RLS_REFERENCE: dict = {
+    "lms_algorithm": "rls",
+    "lms_params": {
+        "M": 7,
+        "delay_step": 4,
+        "N_eff": 1409.281222670354,
+        "delta": 5.11410341560248,
+        "diag_load": 0.14339015026730578,
+        "huber_c": 2.5014879715311853,
+        "warm_start_ratio": 0.0,
+        "lam": 0.9992904184176206,
+    },
+    "hr_algorithm": "periodogram",
+    "hr_params": {"nfft": 8192, "window_type": "hann"},
 }
 
 # Reference 5-fold Group K-Fold CV results from Project 1 for direct comparison
@@ -261,32 +308,48 @@ class ConditionalTPE:
         order = np.argsort(losses)
         return [pool[i][0] for i in order[:n_good]], [pool[i][0] for i in order[n_good:]]
 
-    def sample_rls_node(self) -> dict:
-        """Sample re-architected RLS hyperparameters (`M`, `delay_step`, `N_eff`, `delta`, `diag_load`, `huber_c`, `warm_start_ratio`)."""
+    def sample_lms_node(self, lms_algo: str = "rls") -> dict:
+        """Sample hyperparameters for `lms_algo` ('rls', 'nlms', 'vs_lms', or 'lms')."""
         use_tpe = len(self.trials) >= self.n_startup_trials
         good_cfgs, bad_cfgs = self._split_good_bad() if use_tpe else ([], [])
 
-        subspace = CONDITIONAL_SEARCH_SPACE["rls_subspace"]
-        good_branch = [c["lms_params"] for c in good_cfgs if "lms_params" in c]
-        bad_branch = [c["lms_params"] for c in bad_cfgs if "lms_params" in c]
+        subspace = CONDITIONAL_SEARCH_SPACE["lms_subspaces"][lms_algo]
+        good_branch = [
+            c["lms_params"]
+            for c in good_cfgs
+            if c.get("lms_algorithm") == lms_algo and "lms_params" in c
+        ]
+        bad_branch = [
+            c["lms_params"]
+            for c in bad_cfgs
+            if c.get("lms_algorithm") == lms_algo and "lms_params" in c
+        ]
 
-        rls_params = {}
+        params = {}
         for pname, pspec in subspace.items():
             if len(good_branch) >= 2 and len(bad_branch) >= 2:
-                rls_params[pname] = self._sample_tpe_1d(
+                params[pname] = self._sample_tpe_1d(
                     pspec,
                     [p[pname] for p in good_branch if pname in p],
                     [p[pname] for p in bad_branch if pname in p],
                 )
             else:
-                rls_params[pname] = self._sample_param_prior(pspec)
+                params[pname] = self._sample_param_prior(pspec)
 
-        rls_params["lam"] = float(1.0 - (1.0 / float(rls_params["N_eff"])))
-        return {"lms_algorithm": "rls", "lms_params": rls_params}
+        if lms_algo == "rls":
+            params["lam"] = float(1.0 - (1.0 / float(params["N_eff"])))
+        elif lms_algo == "vs_lms" and params["mu_min"] >= params["mu_max"]:
+            params["mu_min"] = min(params["mu_min"], params["mu_max"] * 0.25)
 
-    def sample_full_tree(self) -> dict:
-        """Sample a complete conditional tree configuration (RLS hyperparameters + HR detector branch)."""
-        rls_branch = self.sample_rls_node()
+        return {"lms_algorithm": lms_algo, "lms_params": params}
+
+    def sample_rls_node(self) -> dict:
+        """Sample re-architected RLS hyperparameters."""
+        return self.sample_lms_node("rls")
+
+    def sample_full_tree(self, lms_algo: str = "rls") -> dict:
+        """Sample a complete conditional tree configuration (`lms_algo` hyperparameters + HR detector branch)."""
+        lms_branch = self.sample_lms_node(lms_algo)
         use_tpe = len(self.trials) >= self.n_startup_trials
         good_cfgs, bad_cfgs = self._split_good_bad() if use_tpe else ([], [])
 
@@ -334,8 +397,8 @@ class ConditionalTPE:
                 hr_params[pname] = self._sample_param_prior(pspec)
 
         return {
-            "lms_algorithm": "rls",
-            "lms_params": rls_branch["lms_params"],
+            "lms_algorithm": lms_algo,
+            "lms_params": lms_branch["lms_params"],
             "hr_algorithm": hr_algo,
             "hr_params": hr_params,
         }
@@ -425,22 +488,23 @@ def run_phase1_snr_screening(
     preprocessed_windows: list[tuple],
     y: np.ndarray,
     screening_indices: np.ndarray,
+    lms_algo: str = "rls",
     n_trials: int = 16,
     top_k: int = 3,
     seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
-    """Phase 1: Fast Screening of RLS hyperparameters on a subset of training windows.
+    """Phase 1: Fast Screening of `lms_algo` hyperparameters on a subset of training windows.
 
-    Evaluates candidate RLS configurations on `screening_indices` by measuring both
+    Evaluates candidate configurations on `screening_indices` by measuring both
     in-band cardiac spectral SNR and periodogram BPM accuracy against ground-truth `y`.
     """
     tpe = ConditionalTPE(seed=seed, gamma_quantile=0.25, n_startup_trials=6)
     phase1_history: list[dict] = []
 
     for trial_idx in range(n_trials):
-        candidate = tpe.sample_rls_node()
-        rls_params = dict(candidate["lms_params"])
-        M = int(rls_params.pop("M"))
+        candidate = tpe.sample_lms_node(lms_algo)
+        algo_params = dict(candidate["lms_params"])
+        M = int(algo_params.pop("M"))
 
         snr_scores = []
         bpm_preds = []
@@ -449,7 +513,7 @@ def run_phase1_snr_screening(
 
         for idx in screening_indices:
             cached_win = preprocessed_windows[int(idx)]
-            e_fused = _filter_cached_window(cached_win, "rls", M, rls_params)
+            e_fused = _filter_cached_window(cached_win, lms_algo, M, algo_params)
             if not np.all(np.isfinite(e_fused)):
                 diverged = True
                 break
@@ -467,7 +531,7 @@ def run_phase1_snr_screening(
         phase1_history.append(
             {
                 "trial": trial_idx,
-                "lms_algorithm": "rls",
+                "lms_algorithm": lms_algo,
                 "lms_params": dict(candidate["lms_params"]),
                 "mean_snr": mean_snr,
                 "screen_objective": screen_obj,
@@ -475,25 +539,26 @@ def run_phase1_snr_screening(
         )
 
     sorted_trials = sorted(phase1_history, key=lambda r: r["screen_objective"])
-    top_rls_configs = [
-        {"lms_algorithm": "rls", "lms_params": dict(t["lms_params"])}
+    top_configs = [
+        {"lms_algorithm": lms_algo, "lms_params": dict(t["lms_params"])}
         for t in sorted_trials[:top_k]
     ]
-    return top_rls_configs, phase1_history
+    return top_configs, phase1_history
 
 
 def run_phase2_tpe_optimization(
     preprocessed_windows: list[tuple],
     y: np.ndarray,
     splits: list[tuple[np.ndarray, np.ndarray]],
-    seed_rls_configs: list[dict],
+    seed_configs: list[dict],
+    lms_algo: str = "rls",
     n_trials: int = 18,
     prune_percentile: float = 50.0,
     seed: int = 42,
 ) -> tuple[dict, float, list[dict]]:
-    """Phase 2: End-to-End TPE Optimization of RLS + HR Detector (`periodogram` vs `elgendi`) across Group K-Folds."""
+    """Phase 2: End-to-End TPE Optimization of `lms_algo` + HR Detector (`periodogram` vs `elgendi`) across Group K-Folds."""
     warm_start_queue: list[dict] = []
-    for rls_cfg in seed_rls_configs:
+    for cfg in seed_configs:
         for hr_algo in CONDITIONAL_SEARCH_SPACE["hr_algorithm"]:
             hr_default = (
                 {"nfft": 8192, "window_type": "hamming"}
@@ -502,8 +567,8 @@ def run_phase2_tpe_optimization(
             )
             warm_start_queue.append(
                 {
-                    "lms_algorithm": "rls",
-                    "lms_params": dict(rls_cfg["lms_params"]),
+                    "lms_algorithm": lms_algo,
+                    "lms_params": dict(cfg["lms_params"]),
                     "hr_algorithm": hr_algo,
                     "hr_params": hr_default,
                 }
@@ -528,10 +593,10 @@ def run_phase2_tpe_optimization(
         if is_warm_start:
             config = warm_start_queue[trial_idx]
         else:
-            config = tpe.sample_full_tree()
+            config = tpe.sample_full_tree(lms_algo)
 
-        rls_params = dict(config["lms_params"])
-        M = int(rls_params.pop("M"))
+        algo_params = dict(config["lms_params"])
+        M = int(algo_params.pop("M"))
         hr_algo = config["hr_algorithm"]
         hr_params = dict(config["hr_params"])
 
@@ -547,7 +612,7 @@ def run_phase2_tpe_optimization(
 
             for w_idx in val_indices:
                 cached_win = preprocessed_windows[int(w_idx)]
-                e_fused = _filter_cached_window(cached_win, "rls", M, rls_params)
+                e_fused = _filter_cached_window(cached_win, lms_algo, M, algo_params)
                 bpm_hat = estimate_bpm_window(e_fused, hr_algorithm=hr_algo, **hr_params)
                 val_preds.append(bpm_hat)
 
@@ -721,12 +786,16 @@ def optimize_hr_pipeline(
     phase1_top_k: int = 3,
     phase2_trials: int = 18,
     prune_percentile: float = 50.0,
+    retrain_algorithms: tuple[str, ...] = ("nlms", "vs_lms"),
+    reoptimize_rls: bool = False,
     seed: int = 42,
 ) -> dict:
-    """Optimize re-architected `rls` hyperparameters and HR detector (`periodogram` vs `elgendi`) via Group K-Fold CV.
+    """Optimize `nlms` and `vs_lms` (and optionally `rls`) hyperparameters via Group K-Fold CV.
 
-    `nlms` and `vs_lms` are included directly with their optimal hyperparameters already
-    obtained in Project 1 so they do not need to be re-optimized.
+    By default (`reoptimize_rls=False`), `rls` uses the already-optimized Project 2
+    `PROJECT2_RLS_REFERENCE` configuration while `retrain_algorithms` (`nlms`, `vs_lms`)
+    are retrained from scratch on the new Option B pipeline (`delay_step`, `huber_c`,
+    `warm_start_ratio` + step-size parameters and HR detector).
     """
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -744,27 +813,107 @@ def optimize_hr_pipeline(
 
     baseline_cv = evaluate_baseline_without_lms(preprocessed_windows, y, splits)
 
-    # Optimize ONLY the re-architected RLS algorithm and HR detection model
-    top_rls_cfg, p1_hist = run_phase1_snr_screening(
-        preprocessed_windows=preprocessed_windows,
-        y=y,
-        screening_indices=screening_indices,
-        n_trials=phase1_trials,
-        top_k=phase1_top_k,
-        seed=seed,
-    )
-    best_rls_cfg, best_rls_obj, p2_hist = run_phase2_tpe_optimization(
-        preprocessed_windows=preprocessed_windows,
-        y=y,
-        splits=splits,
-        seed_rls_configs=top_rls_cfg,
-        n_trials=phase2_trials,
-        prune_percentile=prune_percentile,
-        seed=seed,
-    )
+    results_by_lms: dict[str, dict] = {}
+    all_p1_hist: list[dict] = []
+    all_p2_hist: list[dict] = []
+    rls_p1_hist: list[dict] = []
+    rls_p2_hist: list[dict] = []
+    top_rls_cfg: list[dict] = []
 
-    unpruned = [t for t in p2_hist if not t["pruned"]]
-    best_rls_trial = min(unpruned if unpruned else p2_hist, key=lambda r: r["score_objective"])
+    for idx_algo, algo_name in enumerate(retrain_algorithms):
+        algo_seed = seed + (idx_algo + 1) * 100
+        top_cfg, p1_hist = run_phase1_snr_screening(
+            preprocessed_windows=preprocessed_windows,
+            y=y,
+            screening_indices=screening_indices,
+            lms_algo=algo_name,
+            n_trials=phase1_trials,
+            top_k=phase1_top_k,
+            seed=algo_seed,
+        )
+        best_cfg, _, p2_hist = run_phase2_tpe_optimization(
+            preprocessed_windows=preprocessed_windows,
+            y=y,
+            splits=splits,
+            seed_configs=top_cfg,
+            lms_algo=algo_name,
+            n_trials=phase2_trials,
+            prune_percentile=prune_percentile,
+            seed=algo_seed,
+        )
+        all_p1_hist.extend(p1_hist)
+        all_p2_hist.extend(p2_hist)
+
+        unpruned = [t for t in p2_hist if not t["pruned"]]
+        best_trial = min(unpruned if unpruned else p2_hist, key=lambda r: r["score_objective"])
+
+        params_copy = dict(best_cfg["lms_params"])
+        best_M = int(params_copy.pop("M"))
+        model = HeartRateEstimatorModel(
+            lms_algorithm=algo_name,
+            M=best_M,
+            lms_params=params_copy,
+            hr_algorithm=best_cfg["hr_algorithm"],
+            hr_params=best_cfg["hr_params"],
+            fs=FS,
+        )
+        results_by_lms[algo_name] = {
+            "model": model,
+            "hyperparameters": best_cfg,
+            "score_objective": float(best_trial["score_objective"]),
+            "score_aae": float(best_trial["score_aae"]),
+            "score_rmse": float(best_trial["score_rmse"]),
+            "outlier_pct": float(best_trial["outlier_pct"]),
+        }
+
+    if reoptimize_rls:
+        top_rls_cfg, rls_p1_hist = run_phase1_snr_screening(
+            preprocessed_windows=preprocessed_windows,
+            y=y,
+            screening_indices=screening_indices,
+            lms_algo="rls",
+            n_trials=phase1_trials,
+            top_k=phase1_top_k,
+            seed=seed,
+        )
+        best_rls_cfg, best_rls_obj, rls_p2_hist = run_phase2_tpe_optimization(
+            preprocessed_windows=preprocessed_windows,
+            y=y,
+            splits=splits,
+            seed_configs=top_rls_cfg,
+            lms_algo="rls",
+            n_trials=phase2_trials,
+            prune_percentile=prune_percentile,
+            seed=seed,
+        )
+        unpruned = [t for t in rls_p2_hist if not t["pruned"]]
+        best_rls_trial = min(unpruned if unpruned else rls_p2_hist, key=lambda r: r["score_objective"])
+        rls_cv = {
+            "score_objective": float(best_rls_trial["score_objective"]),
+            "score_aae": float(best_rls_trial["score_aae"]),
+            "score_rmse": float(best_rls_trial["score_rmse"]),
+            "outlier_pct": float(best_rls_trial["outlier_pct"]),
+        }
+    else:
+        best_rls_cfg = {
+            "lms_algorithm": "rls",
+            "lms_params": dict(PROJECT2_RLS_REFERENCE["lms_params"]),
+            "hr_algorithm": PROJECT2_RLS_REFERENCE["hr_algorithm"],
+            "hr_params": dict(PROJECT2_RLS_REFERENCE["hr_params"]),
+        }
+        rls_params_eval = dict(best_rls_cfg["lms_params"])
+        rls_M_eval = int(rls_params_eval.pop("M"))
+        rls_cv = evaluate_model_cv(
+            preprocessed_windows,
+            y,
+            splits,
+            lms_algo="rls",
+            M=rls_M_eval,
+            lms_params=rls_params_eval,
+            hr_algo=best_rls_cfg["hr_algorithm"],
+            hr_params=best_rls_cfg["hr_params"],
+        )
+        best_rls_obj = float(rls_cv["score_objective"])
 
     rls_params_copy = dict(best_rls_cfg["lms_params"])
     best_M = int(rls_params_copy.pop("M"))
@@ -776,70 +925,13 @@ def optimize_hr_pipeline(
         hr_params=best_rls_cfg["hr_params"],
         fs=FS,
     )
-
-    # Option B (Feature-Matched): apply the winning RLS structural features
-    # (`delay_step`, `huber_c`, `warm_start_ratio`) to Project 1 optimal NLMS & VS-LMS
-    shared_opt_b = {
-        k: best_rls_cfg["lms_params"][k]
-        for k in ("delay_step", "huber_c", "warm_start_ratio")
-        if k in best_rls_cfg["lms_params"]
-    }
-    nlms_model = HeartRateEstimatorModel.from_project1_optimal("nlms", fs=FS, **shared_opt_b)
-    vs_lms_model = HeartRateEstimatorModel.from_project1_optimal("vs_lms", fs=FS, **shared_opt_b)
-
-    nlms_cv = evaluate_model_cv(
-        preprocessed_windows,
-        y,
-        splits,
-        lms_algo=nlms_model.lms_algorithm,
-        M=nlms_model.M,
-        lms_params=nlms_model.lms_params,
-        hr_algo=nlms_model.hr_algorithm,
-        hr_params=nlms_model.hr_params,
-    )
-    vs_lms_cv = evaluate_model_cv(
-        preprocessed_windows,
-        y,
-        splits,
-        lms_algo=vs_lms_model.lms_algorithm,
-        M=vs_lms_model.M,
-        lms_params=vs_lms_model.lms_params,
-        hr_algo=vs_lms_model.hr_algorithm,
-        hr_params=vs_lms_model.hr_params,
-    )
-
-    results_by_lms: dict[str, dict] = {
-        "nlms": {
-            "model": nlms_model,
-            "hyperparameters": {
-                "lms_algorithm": nlms_model.lms_algorithm,
-                "lms_params": {"M": nlms_model.M, **nlms_model.lms_params},
-                "hr_algorithm": nlms_model.hr_algorithm,
-                "hr_params": dict(nlms_model.hr_params),
-            },
-            **nlms_cv,
-        },
-        "vs_lms": {
-            "model": vs_lms_model,
-            "hyperparameters": {
-                "lms_algorithm": vs_lms_model.lms_algorithm,
-                "lms_params": {"M": vs_lms_model.M, **vs_lms_model.lms_params},
-                "hr_algorithm": vs_lms_model.hr_algorithm,
-                "hr_params": dict(vs_lms_model.hr_params),
-            },
-            **vs_lms_cv,
-        },
-        "rls": {
-            "model": rls_model,
-            "hyperparameters": best_rls_cfg,
-            "score_objective": float(best_rls_trial["score_objective"]),
-            "score_aae": float(best_rls_trial["score_aae"]),
-            "score_rmse": float(best_rls_trial["score_rmse"]),
-            "outlier_pct": float(best_rls_trial["outlier_pct"]),
-        },
+    results_by_lms["rls"] = {
+        "model": rls_model,
+        "hyperparameters": best_rls_cfg,
+        **rls_cv,
     }
 
-    comparison_summary = summarize_algorithm_comparisons(p1_hist, p2_hist)
+    comparison_summary = summarize_algorithm_comparisons(rls_p1_hist, rls_p2_hist)
 
     return {
         "rls_model": rls_model,
@@ -850,6 +942,6 @@ def optimize_hr_pipeline(
         "baseline_cv": baseline_cv,
         "comparison_summary": comparison_summary,
         "phase1_top_rls": top_rls_cfg,
-        "phase1_trials": p1_hist,
-        "phase2_trials": p2_hist,
+        "phase1_trials": rls_p1_hist + all_p1_hist,
+        "phase2_trials": rls_p2_hist + all_p2_hist,
     }
